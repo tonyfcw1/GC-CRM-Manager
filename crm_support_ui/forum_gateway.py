@@ -5,7 +5,7 @@ import time
 from html import unescape
 from http.cookies import SimpleCookie
 from typing import Iterable
-from urllib.parse import parse_qs, quote_plus, urljoin, urlparse
+from urllib.parse import parse_qs, parse_qsl, quote_plus, urlencode, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -15,7 +15,7 @@ BASE_URL = "https://gcdn.grapecity.com.cn"
 EDIT_URL = (
     f"{BASE_URL}/forum.php?mod=post&action=newthread&fid=230&special=3"
 )
-DEFAULT_TYPEID = "286"
+UNPROCESSED_TYPEID = "286"
 MAX_TITLE_LENGTH = 80
 MAX_COOKIE_LENGTH = 16_000
 MAX_CONTENT_LENGTH = 200_000
@@ -153,6 +153,24 @@ def _field_value(fields: Iterable[tuple[str, str]], name: str) -> str:
     return ""
 
 
+def _replace_query_fields(url: str, values: dict[str, str]) -> str:
+    parsed = urlparse(url)
+    fields = parse_qsl(parsed.query, keep_blank_values=True)
+    for name, value in values.items():
+        _replace_field(fields, name, value)
+    return parsed._replace(query=urlencode(fields)).geturl()
+
+
+def _normalize_rewardprice(value: str) -> str:
+    try:
+        normalized = int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise ForumPostError("悬赏金币必须是整数") from exc
+    if normalized < 1:
+        raise ForumPostError("悬赏金币必须大于 0")
+    return str(normalized)
+
+
 def _extract_formhash(html: str, fields: Iterable[tuple[str, str]]) -> str:
     formhash = _field_value(fields, "formhash").strip()
     if formhash:
@@ -220,7 +238,7 @@ def create_forum_post(
     cookie: str,
     title: str,
     content: str,
-    rewardprice: str = "1",
+    rewardprice: str | None = None,
 ) -> dict[str, str]:
     """Create one topic using a caller-provided, already-authenticated cookie.
 
@@ -237,12 +255,10 @@ def create_forum_post(
         raise ForumPostError("论坛帖子内容不能为空")
     if len(normalized_content) > MAX_CONTENT_LENGTH:
         raise ForumPostError("论坛帖子内容过长")
-    try:
-        normalized_reward = str(int(str(rewardprice or "1").strip()))
-    except (TypeError, ValueError) as exc:
-        raise ForumPostError("悬赏金币必须是整数") from exc
-    if int(normalized_reward) < 0:
-        raise ForumPostError("悬赏金币不能为负数")
+    requested_reward = "" if rewardprice is None else str(rewardprice).strip()
+    normalized_reward = (
+        _normalize_rewardprice(requested_reward) if requested_reward else ""
+    )
 
     cookie_jar = _load_cookie_jar(cookie)
     session = requests.Session()
@@ -275,12 +291,21 @@ def create_forum_post(
         if not formhash:
             raise ForumPostError("没有取得 formhash，请刷新论坛登录状态后重试")
 
+        form_special = _field_value(fields, "special").strip()
+        form_reward = _field_value(fields, "rewardprice").strip()
+        if form_special != "3" or not form_reward:
+            raise ForumPostError(
+                "论坛没有返回悬赏发帖表单；请确认当前账号和版块允许发布悬赏主题"
+            )
+        if not normalized_reward:
+            normalized_reward = _normalize_rewardprice(form_reward)
+
         _replace_field(fields, "formhash", formhash)
         _replace_field(fields, "subject", normalized_title)
         _replace_field(fields, "message", normalized_content)
         _replace_field(fields, "rewardprice", normalized_reward)
         _replace_field(fields, "special", "3")
-        _replace_field(fields, "typeid", _field_value(fields, "typeid") or DEFAULT_TYPEID)
+        _replace_field(fields, "typeid", UNPROCESSED_TYPEID)
         _replace_field(fields, "wysiwyg", _field_value(fields, "wysiwyg") or "0")
         _replace_field(fields, "posttime", _field_value(fields, "posttime") or str(int(time.time())))
         _replace_field(fields, "topicsubmit", "true")
@@ -288,8 +313,10 @@ def create_forum_post(
         action = urljoin(EDIT_URL, form.get("action") or "")
         if not action.startswith(f"{BASE_URL}/"):
             raise ForumPostError("论坛发帖表单地址不在 GCDN 域名内")
-        if "topicsubmit=" not in action.lower():
-            action += "&topicsubmit=yes" if "?" in action else "?topicsubmit=yes"
+        action = _replace_query_fields(
+            action,
+            {"special": "3", "topicsubmit": "yes"},
+        )
         response = session.post(
             action,
             data=_encode_gbk_form(fields),
@@ -322,4 +349,8 @@ def create_forum_post(
     if not published:
         summary = _response_summary(response)
         raise ForumPostError(f"论坛未确认发布成功：{summary or '服务器返回了未知页面'}")
-    return {"url": response_url, "title": normalized_title}
+    return {
+        "url": response_url,
+        "title": normalized_title,
+        "rewardprice": normalized_reward,
+    }

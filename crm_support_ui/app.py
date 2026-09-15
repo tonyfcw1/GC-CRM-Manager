@@ -56,7 +56,7 @@ class ForumPostInput(BaseModel):
     cookie: str
     title: str
     content: str
-    rewardprice: str = "1"
+    rewardprice: str | None = None
 
 
 def build_default_gateway() -> DataverseGateway:

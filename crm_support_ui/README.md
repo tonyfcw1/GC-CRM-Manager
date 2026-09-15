@@ -74,9 +74,9 @@ python -m unittest work.test_crm_support_ui
 - `CRM_AZ_PATH`：Azure CLI 的完整路径
 - `CRM_BATCH_DATABASE`：批量任务 SQLite 文件路径
 
-论坛发帖接口为 `POST /api/forum-post`，只接受单条请求中的 `cookie`、`title`、`content` 和可选 `rewardprice` 字段。它不会读取浏览器 Cookie，也不会把 Cookie 写入服务端存储。前端可选择将 Cookie 保存在当前浏览器的 `localStorage`，仅用于下次自动回填。
+论坛发帖接口为 `POST /api/forum-post`，只接受单条请求中的 `cookie`、`title`、`content` 和可选 `rewardprice` 字段。未提供 `rewardprice` 时使用论坛悬赏表单针对当前账号返回的默认值。它不会读取浏览器 Cookie，也不会把 Cookie 写入服务端存储。前端可选择将 Cookie 保存在当前浏览器的 `localStorage`，仅用于下次自动回填。
 
-前端默认使用求助中心的 `special=3` 表单，悬赏金币为 1。
+前端使用求助中心的悬赏表单，提交地址和表单正文都会明确指定 `special=3`，并固定提交“未处理”主题分类（`typeid=286`）。如果论坛没有返回悬赏金额字段或悬赏类型不正确，接口会停止发布并返回错误，避免创建成普通帖子。
 
 前端单条录入勾选论坛选项后会显示独立的论坛主题和内容输入框，需要单独填写，不会自动带入 CRM 主题、说明、客户/商机名称、日期或 CRM 链接。论坛请求只发送用户填写的帖子主题和内容。“单独发帖”按钮只调用论坛接口，不创建 CRM 案例；发帖失败时当前表单会保留，成功后只清空当前表单。Cookie 输入旁的“记住 Cookie”选项控制浏览器本地保存，旁边的清除操作可以立即删除已保存值；已保存的 Cookie 不会因成功发帖而清除。批量录入暂不自动发帖。
 

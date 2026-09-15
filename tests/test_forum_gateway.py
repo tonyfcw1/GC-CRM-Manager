@@ -1,6 +1,6 @@
 import unittest
 from unittest.mock import patch
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlparse
 
 from fastapi.testclient import TestClient
 from requests.cookies import RequestsCookieJar
@@ -38,6 +38,27 @@ FORM_HTML_WITH_EXTERNAL_FORMHASH = FORM_HTML.replace(
 ).replace(
     "</body>",
     '<a href="https://example.invalid/?formhash=not-the-forum-token">外部链接</a></body>',
+)
+
+FORM_HTML_WITHOUT_REWARD_FIELDS = FORM_HTML.replace(
+    '    <input type="hidden" name="special" value="3">\n',
+    "",
+).replace(
+    '    <input type="hidden" name="rewardprice" value="1">\n',
+    "",
+)
+
+FORM_HTML_WITH_UNSELECTED_TYPE = FORM_HTML.replace(
+    '<select name="typeid"><option value="286" selected>求助</option></select>',
+    (
+        '<select name="typeid">'
+        '<option value="0" selected>选择主题分类</option>'
+        '<option value="286">未处理</option>'
+        '<option value="199">处理中</option>'
+        '<option value="201">调研中</option>'
+        '<option value="200">已处理</option>'
+        '</select>'
+    ),
 )
 
 
@@ -86,11 +107,13 @@ class ForumGatewayTests(unittest.TestCase):
             )
 
         self.assertIn("tid=123", result["url"])
+        self.assertEqual(result["rewardprice"], "1")
         self.assertEqual(session.cookies.get("sid"), "abc")
         self.assertEqual(session.cookies.get("uid"), "42")
         self.assertTrue(session.closed)
         posted_url, body, headers, _, allow_redirects = session.posted
         self.assertIn("topicsubmit=yes", posted_url)
+        self.assertEqual(parse_qs(urlparse(posted_url).query)["special"], ["3"])
         self.assertEqual(headers["Content-Type"], "application/x-www-form-urlencoded")
         self.assertTrue(allow_redirects)
         fields = parse_qs(body.decode("ascii"), encoding="gbk")
@@ -99,7 +122,51 @@ class ForumGatewayTests(unittest.TestCase):
         self.assertEqual(fields["message"], ["第一行\n第二行"])
         self.assertEqual(fields["typeid"], ["286"])
         self.assertEqual(fields["special"], ["3"])
+        self.assertEqual(fields["rewardprice"], ["1"])
         self.assertEqual(fields["topicsubmit"], ["true"])
+
+    def test_uses_reward_value_from_forum_form_when_not_explicitly_set(self) -> None:
+        html = FORM_HTML.replace(
+            'name="rewardprice" value="1"',
+            'name="rewardprice" value="5"',
+        )
+        session = FakeSession(html)
+        with patch("crm_support_ui.forum_gateway.requests.Session", return_value=session):
+            result = create_forum_post(
+                cookie="sid=abc",
+                title="中文主题",
+                content="正文",
+                rewardprice=None,
+            )
+
+        self.assertIn("tid=123", result["url"])
+        self.assertEqual(result["rewardprice"], "5")
+        fields = parse_qs(session.posted[1].decode("ascii"), encoding="gbk")
+        self.assertEqual(fields["rewardprice"], ["5"])
+
+    def test_does_not_publish_when_forum_returns_a_normal_topic_form(self) -> None:
+        session = FakeSession(FORM_HTML_WITHOUT_REWARD_FIELDS)
+        with patch("crm_support_ui.forum_gateway.requests.Session", return_value=session):
+            with self.assertRaisesRegex(ForumPostError, "悬赏"):
+                create_forum_post(
+                    cookie="sid=abc",
+                    title="中文主题",
+                    content="正文",
+                )
+
+        self.assertIsNone(session.posted)
+
+    def test_sets_unprocessed_type_when_forum_default_has_no_status(self) -> None:
+        session = FakeSession(FORM_HTML_WITH_UNSELECTED_TYPE)
+        with patch("crm_support_ui.forum_gateway.requests.Session", return_value=session):
+            create_forum_post(
+                cookie="sid=abc",
+                title="中文主题",
+                content="正文",
+            )
+
+        fields = parse_qs(session.posted[1].decode("ascii"), encoding="gbk")
+        self.assertEqual(fields["typeid"], ["286"])
 
     def test_extracts_formhash_from_an_unquoted_query_parameter(self) -> None:
         session = FakeSession(FORM_HTML_WITH_QUERY_FORMHASH)
@@ -151,6 +218,7 @@ class ForumGatewayTests(unittest.TestCase):
         self.assertEqual(send.call_args.kwargs["cookie"], "sid=secret")
         self.assertEqual(send.call_args.kwargs["title"], "主题")
         self.assertEqual(send.call_args.kwargs["content"], "正文")
+        self.assertIsNone(send.call_args.kwargs["rewardprice"])
 
     def test_forum_endpoint_rejects_overlong_title_before_network_call(self) -> None:
         with patch("crm_support_ui.app.send_forum_post") as send:
