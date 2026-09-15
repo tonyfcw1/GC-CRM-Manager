@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import re
 import time
+from dataclasses import dataclass
 from html import unescape
 from http.cookies import SimpleCookie
-from typing import Iterable
+from typing import Any, Iterable
 from urllib.parse import parse_qs, parse_qsl, quote_plus, urlencode, urljoin, urlparse
 
 import requests
@@ -19,10 +21,47 @@ UNPROCESSED_TYPEID = "286"
 MAX_TITLE_LENGTH = 80
 MAX_COOKIE_LENGTH = 16_000
 MAX_CONTENT_LENGTH = 200_000
+MAX_ATTACHMENT_COUNT = 10
+MAX_ATTACHMENT_SIZE = 10 * 1024 * 1024
+MAX_TOTAL_ATTACHMENT_SIZE = 50 * 1024 * 1024
+
+_ALLOWED_IMAGE_TYPES = frozenset(
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+        "image/bmp",
+    }
+)
+_IMAGE_TYPE_BY_EXTENSION = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+}
+_CANONICAL_EXTENSION_BY_TYPE = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+}
 
 
 class ForumPostError(RuntimeError):
     """A safe-to-display error from the GCDN forum posting flow."""
+
+
+@dataclass(frozen=True)
+class ForumAttachment:
+    """An image kept in memory for one forum-post request."""
+
+    filename: str
+    content: bytes
+    content_type: str = ""
 
 
 def _load_cookie_jar(raw_cookie: str) -> requests.cookies.RequestsCookieJar:
@@ -171,6 +210,366 @@ def _normalize_rewardprice(value: str) -> str:
     return str(normalized)
 
 
+def _detected_image_type(content: bytes) -> str:
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if content.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp"
+    if content.startswith(b"BM"):
+        return "image/bmp"
+    return ""
+
+
+def _safe_attachment_filename(filename: str, content_type: str) -> str:
+    value = str(filename or "").strip()
+    # A browser can hand us a path-like name. Only the final component belongs
+    # in the multipart header, and control characters are never valid there.
+    value = re.split(r"[\\/]", value)[-1]
+    value = "".join(character for character in value if ord(character) >= 32 and ord(character) != 127)
+    extension = _CANONICAL_EXTENSION_BY_TYPE.get(content_type, ".png")
+    if not value:
+        value = f"pasted-image{extension}"
+    else:
+        stem, dot, suffix = value.rpartition(".")
+        if not dot or suffix.lower() not in {
+            candidate_suffix[1:]
+            for candidate_suffix, mime in _IMAGE_TYPE_BY_EXTENSION.items()
+            if mime == content_type
+        }:
+            value = f"{stem if dot else value}{extension}"
+    if len(value) > 255:
+        stem, dot, suffix = value.rpartition(".")
+        if dot:
+            value = f"{stem[: 254 - len(suffix)]}.{suffix}"
+        else:
+            value = value[:255]
+    return value
+
+
+def _normalize_attachments(
+    attachments: Iterable[ForumAttachment] | None,
+) -> list[ForumAttachment]:
+    if attachments is None:
+        return []
+    try:
+        values = list(attachments)
+    except TypeError as exc:
+        raise ForumPostError("论坛图片附件格式无效") from exc
+    if len(values) > MAX_ATTACHMENT_COUNT:
+        raise ForumPostError(f"一次最多上传 {MAX_ATTACHMENT_COUNT} 张图片")
+
+    normalized: list[ForumAttachment] = []
+    total_size = 0
+    for index, attachment in enumerate(values, start=1):
+        if not isinstance(attachment, ForumAttachment):
+            raise ForumPostError("论坛图片附件格式无效")
+        try:
+            content = bytes(attachment.content)
+        except (TypeError, ValueError) as exc:
+            raise ForumPostError(f"第 {index} 张图片内容无效") from exc
+        if not content:
+            raise ForumPostError(f"第 {index} 张图片为空")
+        if len(content) > MAX_ATTACHMENT_SIZE:
+            raise ForumPostError(
+                f"第 {index} 张图片不能超过 {MAX_ATTACHMENT_SIZE // (1024 * 1024)} MB"
+            )
+
+        declared_type = str(attachment.content_type or "").split(";", 1)[0].strip().lower()
+        filename = str(attachment.filename or "").strip()
+        detected_type = _detected_image_type(content)
+        # Do not trust the browser supplied MIME type or filename. A file can
+        # be renamed to .png (or sent with image/png) while containing
+        # arbitrary bytes. The upload endpoint only receives data after a
+        # supported image signature has been detected.
+        if detected_type not in _ALLOWED_IMAGE_TYPES:
+            raise ForumPostError(
+                f"第 {index} 张文件不是有效的 PNG、JPEG、GIF、WEBP 或 BMP 图片"
+            )
+        if declared_type in _ALLOWED_IMAGE_TYPES and declared_type != detected_type:
+            raise ForumPostError(f"第 {index} 张图片格式与文件内容不一致")
+        declared_type = detected_type
+
+        total_size += len(content)
+        if total_size > MAX_TOTAL_ATTACHMENT_SIZE:
+            raise ForumPostError(
+                f"图片总大小不能超过 {MAX_TOTAL_ATTACHMENT_SIZE // (1024 * 1024)} MB"
+            )
+        normalized.append(
+            ForumAttachment(
+                filename=_safe_attachment_filename(filename, declared_type),
+                content=content,
+                content_type=declared_type,
+            )
+        )
+    return normalized
+
+
+def _query_value(url: str, name: str) -> str:
+    for key, values in parse_qs(urlparse(url).query, keep_blank_values=True).items():
+        if key.lower() == name.lower() and values:
+            return str(values[0]).strip()
+    return ""
+
+
+def _script_value(text: str, names: Iterable[str], pattern: str) -> str:
+    joined_names = "|".join(re.escape(name) for name in names)
+    match = re.search(
+        # Discuz exposes these values both as plain assignments (`hash: "…"`)
+        # and as quoted object keys (`"hash":"…"`).
+        rf"(?:\b(?:{joined_names})\b|['\"](?:{joined_names})['\"])\s*(?:[:=])\s*['\"]?{pattern}",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return match.group(1).strip() if match else ""
+
+
+def _upload_url_candidates(html: str, soup: BeautifulSoup) -> list[str]:
+    candidates: list[str] = []
+    normalized_html = unescape(html).replace("\\/", "/").replace("\\u0026", "&")
+    for element in soup.select("[href], [src], [action], [data-upload-url], [data-url]"):
+        for attribute in ("href", "src", "action", "data-upload-url", "data-url"):
+            value = element.get(attribute)
+            if value:
+                candidates.append(unescape(str(value)).replace("\\/", "/"))
+    # Discuz normally embeds the SWFUpload URL in JavaScript. Keep the match
+    # bounded by a quote/whitespace so trailing script syntax is discarded.
+    candidates.extend(
+        match.group(0).rstrip("),;]")
+        for match in re.finditer(
+            r"(?:https?:)?//[^\"'<>\s]+|[^\"'<>\s]*misc\.php\?[^\"'<>\s]+",
+            normalized_html,
+            flags=re.IGNORECASE,
+        )
+    )
+    return candidates
+
+
+def _extract_upload_context(
+    html: str,
+    fields: Iterable[tuple[str, str]],
+    page_url: str,
+    cookie_jar: requests.cookies.RequestsCookieJar,
+) -> tuple[str, str, str]:
+    """Return the same-domain upload URL, uid and hash exposed by the form."""
+
+    soup = BeautifulSoup(html, "html.parser")
+    normalized_html = unescape(html).replace("\\/", "/").replace("\\u0026", "&")
+    upload_url = ""
+    uid = _field_value(fields, "uid").strip()
+    upload_hash = _field_value(fields, "hash").strip()
+    fid = _field_value(fields, "fid").strip() or "230"
+
+    for candidate in _upload_url_candidates(html, soup):
+        parsed = urlparse(urljoin(page_url, candidate))
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        query_keys = {key.lower() for key in query}
+        if parsed.netloc.lower() != urlparse(BASE_URL).netloc.lower():
+            continue
+        if "swfupload" not in parsed.query.lower() or "operation" not in query_keys:
+            continue
+        if _query_value(parsed.geturl(), "operation").lower() != "upload":
+            continue
+        upload_url = parsed.geturl()
+        uid = uid or _query_value(upload_url, "uid")
+        upload_hash = upload_hash or _query_value(upload_url, "hash")
+        fid = _query_value(upload_url, "fid") or fid
+        break
+
+    uid = uid or _script_value(normalized_html, ("discuz_uid", "uid"), r"(\d+)")
+    upload_hash = upload_hash or _script_value(
+        normalized_html,
+        ("uploadhash", "hash"),
+        r"([A-Za-z0-9_-]{8,128})",
+    )
+    if not uid:
+        try:
+            uid = str(cookie_jar.get("uid") or "").strip()
+        except requests.cookies.CookieConflictError:
+            uid = ""
+    if not upload_hash:
+        try:
+            upload_hash = str(cookie_jar.get("hash") or "").strip()
+        except requests.cookies.CookieConflictError:
+            upload_hash = ""
+
+    if not re.fullmatch(r"\d+", uid or "") or not upload_hash:
+        raise ForumPostError("没有取得图片上传凭据，请刷新论坛登录状态后重试")
+    if not upload_url:
+        upload_url = (
+            f"{BASE_URL}/misc.php?mod=swfupload&action=swfupload"
+            f"&operation=upload&fid={quote_plus(fid)}"
+        )
+    if not upload_url.startswith(f"{BASE_URL}/"):
+        raise ForumPostError("论坛图片上传地址不在 GCDN 域名内")
+    return _replace_query_fields(
+        upload_url,
+        {"uid": uid, "hash": upload_hash, "fid": fid},
+    ), uid, upload_hash
+
+
+def _positive_attachment_id(value: Any) -> str:
+    candidate = str(value or "").strip()
+    return candidate if re.fullmatch(r"[1-9]\d*", candidate) else ""
+
+
+def _find_attachment_id(value: Any) -> str:
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            if str(key).lower() in {"aid", "attachid", "attachmentid"}:
+                found = _positive_attachment_id(nested)
+                if found:
+                    return found
+            found = _find_attachment_id(nested)
+            if found:
+                return found
+    elif isinstance(value, (list, tuple)):
+        for nested in value:
+            found = _find_attachment_id(nested)
+            if found:
+                return found
+    return ""
+
+
+def _extract_attachment_id(response: requests.Response) -> str:
+    text = _decode_page(response).strip()
+    direct = _positive_attachment_id(text)
+    if direct:
+        return direct
+    # The normal desktop endpoint returns only the aid. The compact/mobile
+    # variants return one of Discuz's pipe-delimited DISCUZUPLOAD records.
+    parts = text.split("|")
+    if parts and parts[0].strip().upper() == "DISCUZUPLOAD":
+        if len(parts) > 2 and parts[1].strip() == "0":
+            direct = _positive_attachment_id(parts[2])
+            if direct:
+                return direct
+        if len(parts) > 3 and parts[2].strip() == "0":
+            direct = _positive_attachment_id(parts[3])
+            if direct:
+                return direct
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+    found = _find_attachment_id(parsed)
+    if found:
+        return found
+    soup = BeautifulSoup(text, "html.parser")
+    for element in soup.find_all(True):
+        for attribute in ("data-aid", "data-attachid", "data-attachmentid"):
+            found = _positive_attachment_id(element.get(attribute))
+            if found:
+                return found
+    match = re.search(
+        r"(?:aid|attachid|attachmentid)\s*[\"']?\s*[:=]\s*[\"']?(\d+)",
+        text,
+        flags=re.IGNORECASE,
+    )
+    return _positive_attachment_id(match.group(1)) if match else ""
+
+
+def _upload_attachment(
+    session: requests.Session,
+    upload_url: str,
+    uid: str,
+    upload_hash: str,
+    attachment: ForumAttachment,
+    referer: str,
+) -> str:
+    fid = _query_value(upload_url, "fid") or "230"
+    # Discuz reads these two values from the query string while constructing
+    # the uploaded file metadata. Sending them only as multipart fields can
+    # make an otherwise valid image be treated as an arbitrary attachment.
+    request_url = _replace_query_fields(
+        upload_url,
+        {
+            "filetype": attachment.content_type,
+            "type": "image",
+        },
+    )
+    data = {
+        "uid": uid,
+        "hash": upload_hash,
+        "fid": fid,
+        "uploadsubmit": "true",
+        "filetype": attachment.content_type,
+        "filesize": str(len(attachment.content)),
+    }
+    try:
+        response = session.post(
+            request_url,
+            data=data,
+            files={
+                "Filedata": (
+                    attachment.filename,
+                    attachment.content,
+                    attachment.content_type,
+                )
+            },
+            headers={
+                "Referer": referer,
+                "Origin": BASE_URL,
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=20,
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        raise ForumPostError(f"论坛图片上传失败：{exc}") from exc
+    attachment_id = _extract_attachment_id(response)
+    if not attachment_id:
+        summary = _response_summary(response)
+        raise ForumPostError(f"论坛未返回有效图片编号：{summary or '服务器返回了未知响应'}")
+    return attachment_id
+
+
+def _append_attachment_fields(fields: list[tuple[str, str]], attachment_ids: Iterable[str]) -> None:
+    for attachment_id in attachment_ids:
+        fields.extend(
+            (
+                (f"attachnew[{attachment_id}][description]", ""),
+                (f"attachnew[{attachment_id}][readperm]", ""),
+                (f"attachnew[{attachment_id}][price]", "0"),
+            )
+        )
+
+
+def _append_attachment_tags(content: str, attachment_ids: Iterable[str]) -> str:
+    tags = [f"[attachimg]{attachment_id}[/attachimg]" for attachment_id in attachment_ids]
+    return "\n".join((content, *tags)) if tags else content
+
+
+def _best_effort_delete_attachment(
+    session: requests.Session,
+    attachment_id: str,
+    formhash: str,
+    referer: str,
+) -> None:
+    """Remove an uploaded-but-unbound file after a failed posting attempt."""
+
+    try:
+        cleanup_url = (
+            f"{BASE_URL}/forum.php?mod=ajax&action=deleteattach&inajax=yes"
+            f"&formhash={quote_plus(formhash)}&tid=0&pid=0"
+            f"&aids[]={quote_plus(attachment_id)}"
+        )
+        session.get(
+            cleanup_url,
+            headers={"Referer": referer, "Origin": BASE_URL},
+            timeout=10,
+            allow_redirects=True,
+        )
+    except (requests.RequestException, TypeError, AttributeError):
+        # Cleanup is deliberately best effort. The original posting error is
+        # more useful than a secondary failure from an optional endpoint.
+        return
+
+
 def _extract_formhash(html: str, fields: Iterable[tuple[str, str]]) -> str:
     formhash = _field_value(fields, "formhash").strip()
     if formhash:
@@ -239,7 +638,8 @@ def create_forum_post(
     title: str,
     content: str,
     rewardprice: str | None = None,
-) -> dict[str, str]:
+    attachments: Iterable[ForumAttachment] | None = None,
+) -> dict[str, Any]:
     """Create one topic using a caller-provided, already-authenticated cookie.
 
     The cookie is held only by this call and is never returned or logged.
@@ -255,6 +655,7 @@ def create_forum_post(
         raise ForumPostError("论坛帖子内容不能为空")
     if len(normalized_content) > MAX_CONTENT_LENGTH:
         raise ForumPostError("论坛帖子内容过长")
+    normalized_attachments = _normalize_attachments(attachments)
     requested_reward = "" if rewardprice is None else str(rewardprice).strip()
     normalized_reward = (
         _normalize_rewardprice(requested_reward) if requested_reward else ""
@@ -275,6 +676,9 @@ def create_forum_post(
         }
     )
 
+    uploaded_ids: list[str] = []
+    formhash = ""
+    topic_attempted = False
     try:
         page = session.get(EDIT_URL, timeout=20)
         page.raise_for_status()
@@ -300,9 +704,33 @@ def create_forum_post(
         if not normalized_reward:
             normalized_reward = _normalize_rewardprice(form_reward)
 
+        post_content = normalized_content
+        if normalized_attachments:
+            upload_url, uid, upload_hash = _extract_upload_context(
+                html,
+                fields,
+                str(page.url),
+                session.cookies,
+            )
+            for attachment in normalized_attachments:
+                uploaded_ids.append(
+                    _upload_attachment(
+                        session,
+                        upload_url,
+                        uid,
+                        upload_hash,
+                        attachment,
+                        EDIT_URL,
+                    )
+                )
+            post_content = _append_attachment_tags(post_content, uploaded_ids)
+            if len(post_content) > MAX_CONTENT_LENGTH:
+                raise ForumPostError("图片标签加入后，论坛帖子内容过长")
+            _append_attachment_fields(fields, uploaded_ids)
+
         _replace_field(fields, "formhash", formhash)
         _replace_field(fields, "subject", normalized_title)
-        _replace_field(fields, "message", normalized_content)
+        _replace_field(fields, "message", post_content)
         _replace_field(fields, "rewardprice", normalized_reward)
         _replace_field(fields, "special", "3")
         _replace_field(fields, "typeid", UNPROCESSED_TYPEID)
@@ -317,6 +745,7 @@ def create_forum_post(
             action,
             {"special": "3", "topicsubmit": "yes"},
         )
+        topic_attempted = True
         response = session.post(
             action,
             data=_encode_gbk_form(fields),
@@ -329,28 +758,54 @@ def create_forum_post(
             allow_redirects=True,
         )
         response.raise_for_status()
+        response_text = _decode_page(response)
+        response_url = str(response.url)
+        published = bool(
+            re.search(
+                r"(?:showtopic|viewthread|mod=redirect|(?:tid|ptid)=\d+)",
+                response_url,
+                re.IGNORECASE,
+            )
+            or re.search(r"发表成功|发布成功|主题已发布", response_text)
+        )
+        if not published:
+            summary = _response_summary(response)
+            raise ForumPostError(f"论坛未确认发布成功：{summary or '服务器返回了未知页面'}")
     except ForumPostError:
+        if not topic_attempted:
+            for attachment_id in reversed(uploaded_ids):
+                _best_effort_delete_attachment(session, attachment_id, formhash, EDIT_URL)
         raise
     except requests.RequestException as exc:
+        if not topic_attempted:
+            for attachment_id in reversed(uploaded_ids):
+                _best_effort_delete_attachment(session, attachment_id, formhash, EDIT_URL)
         raise ForumPostError(f"论坛网络请求失败：{exc}") from exc
     finally:
         session.close()
 
-    response_text = _decode_page(response)
-    response_url = str(response.url)
-    published = bool(
-        re.search(
-            r"(?:showtopic|viewthread|mod=redirect|(?:tid|ptid)=\d+)",
-            response_url,
-            re.IGNORECASE,
-        )
-        or re.search(r"发表成功|发布成功|主题已发布", response_text)
-    )
-    if not published:
-        summary = _response_summary(response)
-        raise ForumPostError(f"论坛未确认发布成功：{summary or '服务器返回了未知页面'}")
     return {
         "url": response_url,
         "title": normalized_title,
         "rewardprice": normalized_reward,
+        "attachment_count": len(uploaded_ids),
     }
+
+
+def create_forum_post_with_attachments(
+    *,
+    cookie: str,
+    title: str,
+    content: str,
+    attachments: Iterable[ForumAttachment],
+    rewardprice: str | None = None,
+) -> dict[str, Any]:
+    """Explicit multipart-facing wrapper retained as a small public seam."""
+
+    return create_forum_post(
+        cookie=cookie,
+        title=title,
+        content=content,
+        rewardprice=rewardprice,
+        attachments=attachments,
+    )

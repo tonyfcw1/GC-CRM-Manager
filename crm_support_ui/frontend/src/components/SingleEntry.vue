@@ -1,7 +1,7 @@
 <script setup>
-import { computed, h, nextTick, reactive, ref, watch } from "vue";
+import { computed, h, nextTick, onBeforeUnmount, reactive, ref, watch } from "vue";
 import { ElAutoResizer, ElMessage, ElNotification, FixedSizeList } from "element-plus";
-import { Delete, Link, Promotion, Refresh, Search } from "@element-plus/icons-vue";
+import { Delete, Link, Picture, Promotion, Refresh, Search } from "@element-plus/icons-vue";
 import SourceBadge from "./SourceBadge.vue";
 import OpportunityStatus from "./OpportunityStatus.vue";
 import AccountEntitlement from "./AccountEntitlement.vue";
@@ -11,6 +11,11 @@ import {
   buildForumContent,
   clearStoredForumCookie,
   FORUM_TITLE_MAX_LENGTH,
+  MAX_FORUM_ATTACHMENTS,
+  MAX_FORUM_ATTACHMENT_SIZE,
+  MAX_FORUM_TOTAL_ATTACHMENT_SIZE,
+  formatForumFileSize,
+  isForumImageFile,
   loadStoredForumCookie,
   saveStoredForumCookie,
 } from "@/lib/forum";
@@ -43,8 +48,11 @@ const rememberForumCookie = ref(Boolean(forumCookie.value));
 const hasSavedForumCookie = ref(Boolean(forumCookie.value));
 const forumTitleInput = ref(null);
 const forumContentInput = ref(null);
+const forumFileInput = ref(null);
 const forumTitle = ref("");
 const forumContent = ref("");
+const forumAttachments = ref([]);
+let forumAttachmentSequence = 0;
 const form = reactive({
   subject: "",
   description: "",
@@ -75,6 +83,7 @@ watch(
       forumCookie.value = "";
       forumTitle.value = "";
       forumContent.value = "";
+      clearForumAttachments();
       return;
     }
     if (!forumCookie.value.trim()) forumCookie.value = loadStoredForumCookie();
@@ -113,6 +122,110 @@ function clearSavedForumCookie() {
   forumCookie.value = "";
   ElMessage.success("已清除保存的论坛 Cookie");
 }
+
+function revokeForumAttachmentPreview(attachment) {
+  if (
+    attachment?.previewUrl
+    && typeof URL !== "undefined"
+    && typeof URL.revokeObjectURL === "function"
+  ) {
+    URL.revokeObjectURL(attachment.previewUrl);
+  }
+}
+
+function clearForumAttachments() {
+  for (const attachment of forumAttachments.value) revokeForumAttachmentPreview(attachment);
+  forumAttachments.value = [];
+}
+
+function removeForumAttachment(id) {
+  const index = forumAttachments.value.findIndex((attachment) => attachment.id === id);
+  if (index < 0) return;
+  revokeForumAttachmentPreview(forumAttachments.value[index]);
+  forumAttachments.value.splice(index, 1);
+}
+
+function addForumImageFiles(fileList) {
+  const files = Array.from(fileList || []).filter(Boolean);
+  if (!files.length) return;
+  let added = 0;
+  let rejectedType = false;
+  let rejectedSize = false;
+  let rejectedCount = false;
+  let rejectedTotalSize = false;
+  for (const file of files) {
+    if (forumAttachments.value.length >= MAX_FORUM_ATTACHMENTS) {
+      rejectedCount = true;
+      break;
+    }
+    if (!isForumImageFile(file)) {
+      rejectedType = true;
+      continue;
+    }
+    if (Number(file.size) > MAX_FORUM_ATTACHMENT_SIZE) {
+      rejectedSize = true;
+      continue;
+    }
+    const currentTotalSize = forumAttachments.value.reduce(
+      (total, attachment) => total + (Number(attachment.size) || 0),
+      0,
+    );
+    if (currentTotalSize + Number(file.size || 0) > MAX_FORUM_TOTAL_ATTACHMENT_SIZE) {
+      rejectedTotalSize = true;
+      continue;
+    }
+    const id = `forum-image-${Date.now()}-${forumAttachmentSequence++}`;
+    let previewUrl = "";
+    try {
+      if (typeof URL !== "undefined" && typeof URL.createObjectURL === "function") {
+        previewUrl = URL.createObjectURL(file);
+      }
+    } catch {
+      previewUrl = "";
+    }
+    forumAttachments.value.push({
+      id,
+      file,
+      name: file.name || `pasted-image-${forumAttachmentSequence}.png`,
+      size: Number(file.size) || 0,
+      type: file.type || "image/png",
+      previewUrl,
+    });
+    added += 1;
+  }
+  if (rejectedCount) {
+    ElMessage.warning(`一次最多添加 ${MAX_FORUM_ATTACHMENTS} 张图片`);
+  } else if (rejectedType && !added) {
+    ElMessage.warning("只支持 PNG、JPEG、GIF、WEBP 或 BMP 图片");
+  } else if (rejectedType) {
+    ElMessage.warning("部分文件不是支持的图片格式，已跳过");
+  }
+  if (rejectedSize) ElMessage.warning("超过 10 MB 的图片已跳过");
+  if (rejectedTotalSize) ElMessage.warning("图片总大小不能超过 50 MB，超出的图片已跳过");
+}
+
+function handleForumPaste(event) {
+  const files = [];
+  const items = event.clipboardData?.items || [];
+  for (const item of items) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile?.();
+    if (file) files.push(file);
+  }
+  if (!files.length && event.clipboardData?.files?.length) {
+    files.push(...Array.from(event.clipboardData.files));
+  }
+  if (!files.length) return;
+  event.preventDefault();
+  addForumImageFiles(files);
+}
+
+function handleForumFileChange(event) {
+  addForumImageFiles(event.target?.files);
+  if (event.target) event.target.value = "";
+}
+
+onBeforeUnmount(clearForumAttachments);
 
 function selectSource(source) {
   selected.value = source;
@@ -153,7 +266,12 @@ function collectForumInput() {
     return null;
   }
   persistForumCookie();
-  return { cookie: forumCookie.value.trim(), title, content };
+  return {
+    cookie: forumCookie.value.trim(),
+    title,
+    content,
+    attachments: forumAttachments.value.slice(),
+  };
 }
 
 function openConfirmation() {
@@ -176,6 +294,7 @@ function openConfirmation() {
     create_forum_post: form.create_forum_post,
     forum_title: forumTitleValue,
     forum_content: forumContentValue,
+    forum_attachments: form.create_forum_post ? forumAttachments.value.slice() : [],
   };
   confirmVisible.value = true;
 }
@@ -209,6 +328,7 @@ async function postForumOnly() {
       cookie: values.cookie,
       title: values.title,
       content: buildForumContent({ description: values.content }),
+      attachments: values.attachments,
     });
     forumConfirmVisible.value = false;
     forumPending.value = null;
@@ -225,6 +345,7 @@ async function postForumOnly() {
     forumCookie.value = "";
     forumTitle.value = "";
     forumContent.value = "";
+    clearForumAttachments();
     form.create_forum_post = false;
   } catch (error) {
     ElMessage.error({ message: `发帖失败：${error.message}`, duration: 8000, showClose: true });
@@ -243,9 +364,13 @@ async function createIncident() {
   const forumCookieValue = forumRequested ? forumCookie.value.trim() : "";
   const forumTitleValue = forumRequested ? String(values.forum_title || "").trim() : "";
   const forumContentValue = forumRequested ? String(values.forum_content || "").trim() : "";
+  const forumAttachmentsValue = forumRequested
+    ? (values.forum_attachments || forumAttachments.value)
+    : [];
   delete values.create_forum_post;
   delete values.forum_title;
   delete values.forum_content;
+  delete values.forum_attachments;
 
   try {
     const result = await crmApi.createIncident(values);
@@ -258,6 +383,7 @@ async function createIncident() {
           cookie: forumCookieValue,
           title: forumTitleValue,
           content: buildForumContent({ description: forumContentValue }),
+          attachments: forumAttachmentsValue,
         });
       } catch (error) {
         forumError = error;
@@ -316,6 +442,7 @@ async function createIncident() {
       forumCookie.value = "";
       forumTitle.value = "";
       forumContent.value = "";
+      clearForumAttachments();
     }
     historyRefreshKey.value += 1;
     nextTick(() => subjectInput.value?.focus());
@@ -509,8 +636,55 @@ async function createIncident() {
               resize="vertical"
               maxlength="200000"
               show-word-limit
-              placeholder="填写论坛帖子内容"
+              placeholder="填写论坛帖子内容；可直接粘贴图片"
+              @paste="handleForumPaste"
             />
+            <div class="forum-attachment-toolbar">
+              <el-button
+                native-type="button"
+                size="small"
+                plain
+                :icon="Picture"
+                :disabled="forumAttachments.length >= MAX_FORUM_ATTACHMENTS"
+                @click="forumFileInput?.click()"
+              >添加图片</el-button>
+              <input
+                ref="forumFileInput"
+                class="forum-file-input"
+                type="file"
+                accept="image/png,image/jpeg,image/gif,image/webp,image/bmp"
+                multiple
+                @change="handleForumFileChange"
+              />
+              <span class="forum-attachment-hint">
+                {{ forumAttachments.length ? `已添加 ${forumAttachments.length} 张图片` : "支持在内容框中 Ctrl+V 粘贴" }}
+              </span>
+            </div>
+            <div v-if="forumAttachments.length" class="forum-attachment-list">
+              <div v-for="attachment in forumAttachments" :key="attachment.id" class="forum-attachment-item">
+                <img
+                  v-if="attachment.previewUrl"
+                  :src="attachment.previewUrl"
+                  :alt="attachment.name"
+                  class="forum-attachment-preview"
+                />
+                <div v-else class="forum-attachment-placeholder" aria-hidden="true"><Picture /></div>
+                <div class="forum-attachment-meta">
+                  <strong>{{ attachment.name }}</strong>
+                  <small>{{ formatForumFileSize(attachment.size) }}</small>
+                </div>
+                <el-tooltip content="移除图片" placement="top">
+                  <el-button
+                    circle
+                    text
+                    type="danger"
+                    :icon="Delete"
+                    aria-label="移除图片"
+                    @click="removeForumAttachment(attachment.id)"
+                  />
+                </el-tooltip>
+              </div>
+            </div>
           </el-form-item>
           <div class="form-actions">
             <el-button
@@ -542,6 +716,9 @@ async function createIncident() {
       <template v-if="pending.create_forum_post">
         <el-descriptions-item label="论坛主题">{{ pending.forum_title }}</el-descriptions-item>
         <el-descriptions-item label="论坛内容"><span class="pre-wrap">{{ pending.forum_content }}</span></el-descriptions-item>
+        <el-descriptions-item v-if="pending.forum_attachments?.length" label="论坛图片">
+          {{ pending.forum_attachments.length }} 张（将随主题上传）
+        </el-descriptions-item>
       </template>
     </el-descriptions>
     <template #footer>
@@ -560,6 +737,9 @@ async function createIncident() {
     <el-descriptions v-if="forumPending" :column="1" border>
       <el-descriptions-item label="论坛主题">{{ forumPending.title }}</el-descriptions-item>
       <el-descriptions-item label="论坛内容"><span class="pre-wrap">{{ forumPending.content }}</span></el-descriptions-item>
+      <el-descriptions-item v-if="forumPending.attachments?.length" label="论坛图片">
+        {{ forumPending.attachments.length }} 张（将随主题上传）
+      </el-descriptions-item>
     </el-descriptions>
     <template #footer>
       <el-button :disabled="postingForum" @click="closeForumConfirmation">返回修改</el-button>

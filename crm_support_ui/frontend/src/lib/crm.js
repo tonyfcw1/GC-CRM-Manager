@@ -10,9 +10,14 @@ export class ApiError extends Error {
 }
 
 async function request(path, options = {}) {
+  const headers = { ...(options.headers || {}) };
+  const isFormData = typeof FormData !== "undefined" && options.body instanceof FormData;
+  if (!isFormData && !headers["Content-Type"] && !headers["content-type"]) {
+    headers["Content-Type"] = "application/json";
+  }
   const response = await fetch(path, {
     ...options,
-    headers: { "Content-Type": "application/json", ...(options.headers || {}) },
+    headers,
   });
   let body = {};
   try {
@@ -34,7 +39,26 @@ export const crmApi = {
     return request("/api/incidents", { method: "POST", body: JSON.stringify(values) });
   },
   createForumPost(values) {
-    return request("/api/forum-post", { method: "POST", body: JSON.stringify(values) });
+    const attachments = Array.isArray(values?.attachments)
+      ? values.attachments.filter((attachment) => attachment?.file)
+      : [];
+    if (!attachments.length) {
+      const { attachments: _ignored, ...payload } = values || {};
+      return request("/api/forum-post", { method: "POST", body: JSON.stringify(payload) });
+    }
+
+    const body = new FormData();
+    body.append("cookie", String(values?.cookie || ""));
+    body.append("title", String(values?.title || ""));
+    body.append("content", String(values?.content || ""));
+    if (values?.rewardprice != null && String(values.rewardprice).trim()) {
+      body.append("rewardprice", String(values.rewardprice));
+    }
+    for (const attachment of attachments) {
+      const file = attachment.file;
+      body.append("attachments", file, file.name || attachment.name || "pasted-image.png");
+    }
+    return request("/api/forum-post-with-images", { method: "POST", body });
   },
   incidents(limit = 500) {
     return request(`/api/incidents?limit=${encodeURIComponent(limit)}`);

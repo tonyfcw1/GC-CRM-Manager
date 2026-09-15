@@ -5,10 +5,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 import requests
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import File, Form, FastAPI, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
 
 from .dataverse_client import (
     DEFAULT_ENVIRONMENT,
@@ -23,8 +24,13 @@ from .batch_jobs import BatchJobManager, BatchJobStore, parse_excel_tsv
 from .forum_gateway import (
     MAX_CONTENT_LENGTH,
     MAX_TITLE_LENGTH,
+    MAX_ATTACHMENT_COUNT,
+    MAX_ATTACHMENT_SIZE,
+    MAX_TOTAL_ATTACHMENT_SIZE,
+    ForumAttachment,
     ForumPostError,
     create_forum_post as send_forum_post,
+    create_forum_post_with_attachments as send_forum_post_with_attachments,
 )
 
 
@@ -73,6 +79,65 @@ def build_default_gateway() -> DataverseGateway:
 
 def _api_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail=str(exc))
+
+
+async def _read_forum_attachments(
+    uploads: list[UploadFile] | None,
+) -> list[ForumAttachment]:
+    values = uploads or []
+    if len(values) > MAX_ATTACHMENT_COUNT:
+        raise HTTPException(status_code=400, detail=f"一次最多上传 {MAX_ATTACHMENT_COUNT} 张图片")
+    attachments: list[ForumAttachment] = []
+    total_size = 0
+    try:
+        for upload in values:
+            # Read no more than the smaller per-file and remaining aggregate
+            # budget. This keeps an oversized multipart request from being
+            # copied into memory beyond the endpoint's declared limits.
+            remaining_size = MAX_TOTAL_ATTACHMENT_SIZE - total_size
+            if remaining_size <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"图片总大小不能超过 {MAX_TOTAL_ATTACHMENT_SIZE // (1024 * 1024)} MB",
+                )
+            declared_size = getattr(upload, "size", None)
+            if isinstance(declared_size, int) and declared_size >= 0:
+                if declared_size > MAX_ATTACHMENT_SIZE:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"单张图片不能超过 {MAX_ATTACHMENT_SIZE // (1024 * 1024)} MB",
+                    )
+                if declared_size > remaining_size:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"图片总大小不能超过 {MAX_TOTAL_ATTACHMENT_SIZE // (1024 * 1024)} MB",
+                    )
+            content = await upload.read(min(MAX_ATTACHMENT_SIZE + 1, remaining_size + 1))
+            if len(content) > MAX_ATTACHMENT_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"单张图片不能超过 {MAX_ATTACHMENT_SIZE // (1024 * 1024)} MB",
+                )
+            total_size += len(content)
+            if total_size > MAX_TOTAL_ATTACHMENT_SIZE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"图片总大小不能超过 {MAX_TOTAL_ATTACHMENT_SIZE // (1024 * 1024)} MB",
+                )
+            attachments.append(
+                ForumAttachment(
+                    filename=upload.filename or "",
+                    content=content,
+                    content_type=upload.content_type or "",
+                )
+            )
+    finally:
+        for upload in values:
+            try:
+                await upload.close()
+            except Exception:
+                pass
+    return attachments
 
 
 def create_app(
@@ -148,6 +213,47 @@ def create_app(
                 title=values.title,
                 content=values.content,
                 rewardprice=values.rewardprice,
+            )
+        except ForumPostError as exc:
+            raise _api_error(exc) from exc
+
+    @application.post("/api/forum-post-with-images", status_code=201)
+    async def create_forum_post_with_images(
+        response: Response,
+        cookie: str = Form(""),
+        title: str = Form(""),
+        content: str = Form(""),
+        rewardprice: str | None = Form(None),
+        attachments: list[UploadFile] | None = File(None),
+    ) -> dict:
+        """Submit a topic after uploading images from the same authenticated session."""
+
+        response.headers["Cache-Control"] = "no-store"
+        if not cookie.strip():
+            raise HTTPException(status_code=400, detail="论坛 Cookie 不能为空")
+        if not title.strip():
+            raise HTTPException(status_code=400, detail="论坛帖子标题不能为空")
+        if len(title.strip()) > MAX_TITLE_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"论坛帖子标题不能超过 {MAX_TITLE_LENGTH} 个字符",
+            )
+        if not content.strip():
+            raise HTTPException(status_code=400, detail="论坛帖子内容不能为空")
+        if len(content) > MAX_CONTENT_LENGTH:
+            raise HTTPException(status_code=400, detail="论坛帖子内容过长")
+        uploaded = await _read_forum_attachments(attachments)
+        try:
+            # The forum gateway uses the synchronous requests client. Keep
+            # that network work off FastAPI's event loop while the multipart
+            # files are already held in memory for this request.
+            return await run_in_threadpool(
+                send_forum_post_with_attachments,
+                cookie=cookie,
+                title=title,
+                content=content,
+                rewardprice=rewardprice,
+                attachments=uploaded,
             )
         except ForumPostError as exc:
             raise _api_error(exc) from exc

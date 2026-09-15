@@ -137,6 +137,19 @@ h2 { letter-spacing: 0; }
 .forum-cookie-options .el-button { margin-left: auto; padding-inline: 0; }
 .forum-cookie-hint { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.45; }
 .forum-title-item, .forum-content-item { margin-bottom: 16px; }
+.forum-content-item .el-form-item__content { display: grid; gap: 8px; }
+.forum-attachment-toolbar { min-height: 28px; display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.forum-file-input { display: none; }
+.forum-attachment-hint { color: var(--muted); font-size: 11px; line-height: 1.4; }
+.forum-attachment-list { max-height: 190px; padding: 8px; display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; overflow-y: auto; border: 1px solid var(--line); border-radius: 6px; background: #fafcfb; }
+.forum-attachment-item { min-width: 0; min-height: 58px; padding: 5px 6px; display: flex; align-items: center; gap: 8px; border: 1px solid #e6ebe8; border-radius: 5px; background: white; }
+.forum-attachment-preview, .forum-attachment-placeholder { width: 48px; height: 48px; flex: none; border-radius: 4px; }
+.forum-attachment-preview { display: block; object-fit: cover; background: #eef3f0; }
+.forum-attachment-placeholder { display: grid; place-items: center; color: var(--muted); background: #eef3f0; font-size: 20px; }
+.forum-attachment-meta { min-width: 0; flex: 1; display: grid; gap: 3px; }
+.forum-attachment-meta strong, .forum-attachment-meta small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.forum-attachment-meta strong { color: var(--ink); font-size: 11px; font-weight: 700; }
+.forum-attachment-meta small { color: var(--muted); font-size: 10px; }
 .form-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
 .form-actions .el-button + .el-button { margin-left: 0; }
 .pre-wrap { white-space: pre-wrap; }
